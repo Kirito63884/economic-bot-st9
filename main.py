@@ -5,9 +5,8 @@ import sqlite3
 import os
 
 # ================== НАСТРОЙКИ ==================
-TOKEN = "ТВОЙ_ТОКЕН_ЗДЕСЬ"     # Токен бота
-GUILD_ID = None                # ID сервера (int) для мгновенной синхронизации,
-                               # либо None для глобальной синхронизации
+TOKEN = "ТВОЙ_ТОКЕН_ЗДЕСЬ"
+GUILD_ID = None                # int для быстрой синхронизации на одном сервере, либо None
 DB_PATH = "players.db"
 # ===============================================
 
@@ -36,13 +35,13 @@ def get_player(discord_id: int):
     return row
 
 
-def register_player(discord_id: int, steam_id: str) -> bool:
+def register_player(discord_id: int, steam_id: str, start_balance: int = 0) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     try:
         cur.execute(
-            "INSERT INTO players (discord_id, steam_id, balance) VALUES (?, ?, 0)",
-            (discord_id, steam_id)
+            "INSERT INTO players (discord_id, steam_id, balance) VALUES (?, ?, ?)",
+            (discord_id, steam_id, start_balance)
         )
         conn.commit()
         return True
@@ -61,7 +60,6 @@ def update_steam_id(discord_id: int, steam_id: str):
 
 
 def change_balance(discord_id: int, amount: int):
-    """Меняет баланс. Возвращает (ok, new_balance)."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT balance FROM players WHERE discord_id = ?", (discord_id,))
@@ -77,6 +75,16 @@ def change_balance(discord_id: int, amount: int):
     conn.commit()
     conn.close()
     return True, new_balance
+
+
+def delete_player(discord_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM players WHERE discord_id = ?", (discord_id,))
+    changed = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
 
 
 # ---------- Бот ----------
@@ -103,7 +111,15 @@ async def on_ready():
         print(f"❌ Ошибка синхронизации команд: {e}")
 
 
-# ---------- Группа команд ec_ ----------
+# ---------- Хелпер: проверка админа ----------
+def is_admin(interaction: discord.Interaction) -> bool:
+    return (
+        interaction.guild is not None
+        and interaction.user.guild_permissions.administrator
+    )
+
+
+# ---------- Группа команд ec ----------
 class EcGroup(app_commands.Group):
     pass
 
@@ -111,14 +127,64 @@ class EcGroup(app_commands.Group):
 ec_group = EcGroup(name="ec", description="Игровые команды (экономика игроков)")
 
 
-# ----- /ec_register -----
+# ==================================================
+#                    ПОМОЩЬ
+# ==================================================
+
+@ec_group.command(name="help", description="Показать все команды бота")
+async def ec_help(interaction: discord.Interaction):
+    is_adm = is_admin(interaction)
+
+    embed = discord.Embed(
+        title="📖 Список команд бота",
+        description="Все команды используют префикс `/ec_`",
+        color=discord.Color.blurple()
+    )
+
+    # ----- Игровые команды -----
+    embed.add_field(
+        name="👤 Для игроков",
+        value=(
+            "`/ec_help` — показать это сообщение\n"
+            "`/ec_register <steam_id>` — зарегистрироваться (SteamID64, 17 цифр)\n"
+            "`/ec_setsteam <steam_id>` — изменить свой Steam ID\n"
+            "`/ec_profile [@user]` — профиль игрока\n"
+            "`/ec_balance [@user]` — показать баланс\n"
+            "`/ec_top` — топ-10 игроков по балансу"
+        ),
+        inline=False
+    )
+
+    # ----- Админ-команды (видны только админам) -----
+    if is_adm:
+        embed.add_field(
+            name="🛡️ Для администраторов",
+            value=(
+                "`/ec_addmoney @user <сумма>` — начислить монеты\n"
+                "`/ec_removemoney @user <сумма>` — списать монеты\n"
+                "`/ec_setmoney @user <сумма>` — установить точный баланс\n"
+                "`/ec_addplayer <discord_id> <steam_id> [баланс]` — добавить игрока вручную\n"
+                "`/ec_delplayer @user` — удалить игрока из базы"
+            ),
+            inline=False
+        )
+        embed.set_footer(text="Ты видишь админ-команды, потому что у тебя есть права администратора.")
+    else:
+        embed.set_footer(text="Админ-команды скрыты.")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ==================================================
+#                  ИГРОВЫЕ КОМАНДЫ
+# ==================================================
+
 @ec_group.command(name="register", description="Зарегистрироваться в системе (указать Steam ID)")
 @app_commands.describe(steam_id="Твой SteamID64 (17 цифр)")
 async def ec_register(interaction: discord.Interaction, steam_id: str):
     if not (steam_id.isdigit() and len(steam_id) == 17):
         await interaction.response.send_message(
-            "❌ Неверный формат Steam ID. Нужен SteamID64 (17 цифр).",
-            ephemeral=True
+            "❌ Неверный формат Steam ID. Нужен SteamID64 (17 цифр).", ephemeral=True
         )
         return
 
@@ -134,7 +200,6 @@ async def ec_register(interaction: discord.Interaction, steam_id: str):
         )
 
 
-# ----- /ec_setsteam -----
 @ec_group.command(name="setsteam", description="Изменить свой Steam ID")
 @app_commands.describe(steam_id="Новый SteamID64 (17 цифр)")
 async def ec_setsteam(interaction: discord.Interaction, steam_id: str):
@@ -152,7 +217,6 @@ async def ec_setsteam(interaction: discord.Interaction, steam_id: str):
     await interaction.response.send_message(f"✅ Steam ID обновлён: `{steam_id}`", ephemeral=True)
 
 
-# ----- /ec_profile -----
 @ec_group.command(name="profile", description="Показать профиль игрока")
 @app_commands.describe(member="Игрок (по умолчанию — ты)")
 async def ec_profile(interaction: discord.Interaction, member: discord.Member = None):
@@ -176,7 +240,6 @@ async def ec_profile(interaction: discord.Interaction, member: discord.Member = 
     await interaction.response.send_message(embed=embed)
 
 
-# ----- /ec_balance -----
 @ec_group.command(name="balance", description="Показать баланс игрока")
 @app_commands.describe(member="Игрок (по умолчанию — ты)")
 async def ec_balance(interaction: discord.Interaction, member: discord.Member = None):
@@ -190,94 +253,6 @@ async def ec_balance(interaction: discord.Interaction, member: discord.Member = 
     await interaction.response.send_message(f"💰 Баланс {target.mention}: **{player[2]:,}** монет")
 
 
-# ----- /ec_addmoney (только админ) -----
-@ec_group.command(name="addmoney", description="[АДМИН] Начислить монеты игроку")
-@app_commands.describe(member="Игрок", amount="Сумма для начисления")
-@app_commands.default_permissions(administrator=True)
-async def ec_addmoney(interaction: discord.Interaction, member: discord.Member, amount: int):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Только для администраторов.", ephemeral=True)
-        return
-
-    if amount <= 0:
-        await interaction.response.send_message("❌ Сумма должна быть больше нуля.", ephemeral=True)
-        return
-
-    if get_player(member.id) is None:
-        await interaction.response.send_message("❌ Игрок не зарегистрирован.", ephemeral=True)
-        return
-
-    ok, new_balance = change_balance(member.id, amount)
-    if not ok:
-        await interaction.response.send_message("❌ Не удалось изменить баланс.", ephemeral=True)
-        return
-
-    await interaction.response.send_message(
-        f"✅ {member.mention} получил **{amount:,}** монет.\n"
-        f"💰 Новый баланс: **{new_balance:,}**."
-    )
-
-
-# ----- /ec_removemoney (только админ) -----
-@ec_group.command(name="removemoney", description="[АДМИН] Списать монеты у игрока")
-@app_commands.describe(member="Игрок", amount="Сумма для списания")
-@app_commands.default_permissions(administrator=True)
-async def ec_removemoney(interaction: discord.Interaction, member: discord.Member, amount: int):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Только для администраторов.", ephemeral=True)
-        return
-
-    if amount <= 0:
-        await interaction.response.send_message("❌ Сумма должна быть больше нуля.", ephemeral=True)
-        return
-
-    if get_player(member.id) is None:
-        await interaction.response.send_message("❌ Игрок не зарегистрирован.", ephemeral=True)
-        return
-
-    ok, new_balance = change_balance(member.id, -amount)
-    if not ok:
-        await interaction.response.send_message(
-            f"❌ Недостаточно средств. Текущий баланс: **{new_balance:,}** монет.", ephemeral=True
-        )
-        return
-
-    await interaction.response.send_message(
-        f"✅ У {member.mention} списано **{amount:,}** монет.\n"
-        f"💰 Новый баланс: **{new_balance:,}**."
-    )
-
-
-# ----- /ec_setmoney (только админ, установить точное значение) -----
-@ec_group.command(name="setmoney", description="[АДМИН] Установить точный баланс игрока")
-@app_commands.describe(member="Игрок", amount="Новое значение баланса")
-@app_commands.default_permissions(administrator=True)
-async def ec_setmoney(interaction: discord.Interaction, member: discord.Member, amount: int):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Только для администраторов.", ephemeral=True)
-        return
-
-    if amount < 0:
-        await interaction.response.send_message("❌ Баланс не может быть отрицательным.", ephemeral=True)
-        return
-
-    player = get_player(member.id)
-    if player is None:
-        await interaction.response.send_message("❌ Игрок не зарегистрирован.", ephemeral=True)
-        return
-
-    diff = amount - player[2]
-    ok, new_balance = change_balance(member.id, diff)
-    if not ok:
-        await interaction.response.send_message("❌ Не удалось изменить баланс.", ephemeral=True)
-        return
-
-    await interaction.response.send_message(
-        f"✅ Баланс {member.mention} установлен: **{new_balance:,}** монет."
-    )
-
-
-# ----- /ec_top (топ игроков по балансу) -----
 @ec_group.command(name="top", description="Топ-10 игроков по балансу")
 async def ec_top(interaction: discord.Interaction):
     conn = sqlite3.connect(DB_PATH)
@@ -305,6 +280,165 @@ async def ec_top(interaction: discord.Interaction):
             inline=False
         )
     await interaction.response.send_message(embed=embed)
+
+
+# ==================================================
+#                  АДМИН-КОМАНДЫ
+# ==================================================
+
+@ec_group.command(name="addmoney", description="[АДМИН] Начислить монеты игроку")
+@app_commands.describe(member="Игрок", amount="Сумма для начисления")
+@app_commands.default_permissions(administrator=True)
+async def ec_addmoney(interaction: discord.Interaction, member: discord.Member, amount: int):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Только для администраторов.", ephemeral=True)
+        return
+
+    if amount <= 0:
+        await interaction.response.send_message("❌ Сумма должна быть больше нуля.", ephemeral=True)
+        return
+
+    if get_player(member.id) is None:
+        await interaction.response.send_message("❌ Игрок не зарегистрирован.", ephemeral=True)
+        return
+
+    ok, new_balance = change_balance(member.id, amount)
+    if not ok:
+        await interaction.response.send_message("❌ Не удалось изменить баланс.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"✅ {member.mention} получил **{amount:,}** монет.\n💰 Новый баланс: **{new_balance:,}**."
+    )
+
+
+@ec_group.command(name="removemoney", description="[АДМИН] Списать монеты у игрока")
+@app_commands.describe(member="Игрок", amount="Сумма для списания")
+@app_commands.default_permissions(administrator=True)
+async def ec_removemoney(interaction: discord.Interaction, member: discord.Member, amount: int):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Только для администраторов.", ephemeral=True)
+        return
+
+    if amount <= 0:
+        await interaction.response.send_message("❌ Сумма должна быть больше нуля.", ephemeral=True)
+        return
+
+    if get_player(member.id) is None:
+        await interaction.response.send_message("❌ Игрок не зарегистрирован.", ephemeral=True)
+        return
+
+    ok, new_balance = change_balance(member.id, -amount)
+    if not ok:
+        await interaction.response.send_message(
+            f"❌ Недостаточно средств. Текущий баланс: **{new_balance:,}** монет.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"✅ У {member.mention} списано **{amount:,}** монет.\n💰 Новый баланс: **{new_balance:,}**."
+    )
+
+
+@ec_group.command(name="setmoney", description="[АДМИН] Установить точный баланс игрока")
+@app_commands.describe(member="Игрок", amount="Новое значение баланса")
+@app_commands.default_permissions(administrator=True)
+async def ec_setmoney(interaction: discord.Interaction, member: discord.Member, amount: int):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Только для администраторов.", ephemeral=True)
+        return
+
+    if amount < 0:
+        await interaction.response.send_message("❌ Баланс не может быть отрицательным.", ephemeral=True)
+        return
+
+    player = get_player(member.id)
+    if player is None:
+        await interaction.response.send_message("❌ Игрок не зарегистрирован.", ephemeral=True)
+        return
+
+    diff = amount - player[2]
+    ok, new_balance = change_balance(member.id, diff)
+    if not ok:
+        await interaction.response.send_message("❌ Не удалось изменить баланс.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"✅ Баланс {member.mention} установлен: **{new_balance:,}** монет."
+    )
+
+
+# ----- /ec_addplayer — добавление игрока админом -----
+@ec_group.command(name="addplayer", description="[АДМИН] Вручную добавить игрока в базу")
+@app_commands.describe(
+    member="Игрок на сервере (необязательно, если указываешь Discord ID)",
+    discord_id="Discord ID игрока (если не выбираешь через @)",
+    steam_id="SteamID64 (17 цифр)",
+    balance="Начальный баланс (по умолчанию 0)"
+)
+@app_commands.default_permissions(administrator=True)
+async def ec_addplayer(
+    interaction: discord.Interaction,
+    steam_id: str,
+    member: discord.Member = None,
+    discord_id: str = None,
+    balance: int = 0
+):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Только для администраторов.", ephemeral=True)
+        return
+
+    # Определяем целевой Discord ID
+    if member is not None:
+        target_id = member.id
+    elif discord_id is not None and discord_id.isdigit():
+        target_id = int(discord_id)
+    else:
+        await interaction.response.send_message(
+            "❌ Укажи либо `member` (@игрок), либо `discord_id` (число).", ephemeral=True
+        )
+        return
+
+    # Проверка Steam ID
+    if not (steam_id.isdigit() and len(steam_id) == 17):
+        await interaction.response.send_message("❌ SteamID должен быть SteamID64 (17 цифр).", ephemeral=True)
+        return
+
+    if balance < 0:
+        await interaction.response.send_message("❌ Баланс не может быть отрицательным.", ephemeral=True)
+        return
+
+    if get_player(target_id) is not None:
+        await interaction.response.send_message(
+            f"⚠️ Игрок с Discord ID `{target_id}` уже есть в базе.", ephemeral=True
+        )
+        return
+
+    if register_player(target_id, steam_id, balance):
+        who = member.mention if member else f"`{target_id}`"
+        await interaction.response.send_message(
+            f"✅ Игрок {who} добавлен.\n"
+            f"🎮 Steam ID: `{steam_id}`\n"
+            f"💰 Начальный баланс: **{balance:,}** монет."
+        )
+    else:
+        await interaction.response.send_message("❌ Не удалось добавить игрока.", ephemeral=True)
+
+
+# ----- /ec_delplayer — удаление игрока -----
+@ec_group.command(name="delplayer", description="[АДМИН] Удалить игрока из базы")
+@app_commands.describe(member="Игрок, которого нужно удалить")
+@app_commands.default_permissions(administrator=True)
+async def ec_delplayer(interaction: discord.Interaction, member: discord.Member):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Только для администраторов.", ephemeral=True)
+        return
+
+    if not delete_player(member.id):
+        await interaction.response.send_message("❌ Игрок не найден в базе.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(f"🗑️ Игрок {member.mention} удалён из базы.")
 
 
 # Добавляем группу к дереву команд
